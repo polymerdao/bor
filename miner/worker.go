@@ -999,7 +999,13 @@ func (w *worker) commitTransactions(env *environment, txs *types.TransactionsByP
 	}
 
 	close(chDeps)
+	t1 := time.Now()
 	depsWg.Wait()
+	t2 := time.Now()
+	fmt.Println("BLOCK STM Waited for:", t2.Sub(t1))
+	log.Info("BLOCK STM", "Waited for", t2.Sub(t1), "txns", count)
+
+	t3 := time.Now()
 
 	tempDeps := make([][]uint64, len(mvReadMapList))
 
@@ -1033,6 +1039,10 @@ func (w *worker) commitTransactions(env *environment, txs *types.TransactionsByP
 	}
 
 	env.header.TxDependency = tempDeps
+
+	t4 := time.Now()
+	fmt.Println("BLOCK STM Waited for: ", t4.Sub(t3))
+	log.Info("BLOCK STM", "Waited for", t4.Sub(t3), "txns", count)
 
 	if !w.isRunning() && len(coalescedLogs) > 0 {
 		// We don't push the pendingLogsEvent while we are sealing. The reason is that
