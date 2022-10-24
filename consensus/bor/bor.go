@@ -293,19 +293,21 @@ func (c *Bor) Author(header *types.Header) (common.Address, error) {
 
 // VerifyHeader checks whether a header conforms to the consensus rules.
 func (c *Bor) VerifyHeader(chain consensus.ChainHeaderReader, header *types.Header, seal bool) error {
-	return c.verifyHeader(chain, header, nil)
+	return c.verifyHeader(chain, header, nil, nil)
 }
 
-// VerifyHeaders is similar to VerifyHeader, but verifies a batch of headers. The
-// method returns a quit channel to abort the operations and a results channel to
-// retrieve the async verifications (the order is that of the input slice).
-func (c *Bor) VerifyHeaders(chain consensus.ChainHeaderReader, headers []*types.Header, seals []bool) (chan<- struct{}, <-chan error) {
+// VerifyHeaderWithValidators checks whether a header conforms to the consensus rules using the specified validators.
+func (c *Bor) VerifyHeaderWithValidators(chain consensus.ChainHeaderReader, header *types.Header, seal bool, validators []*Validator) error {
+	return c.verifyHeader(chain, header, nil, validators)
+}
+
+func (c *Bor) verifyHeaders(chain consensus.ChainHeaderReader, headers []*types.Header, seals []bool, validators []*Validator) (chan<- struct{}, <-chan error) {
 	abort := make(chan struct{})
 	results := make(chan error, len(headers))
 
 	go func() {
 		for i, header := range headers {
-			err := c.verifyHeader(chain, header, headers[:i])
+			err := c.verifyHeader(chain, header, headers[:i], validators)
 
 			select {
 			case <-abort:
@@ -317,11 +319,25 @@ func (c *Bor) VerifyHeaders(chain consensus.ChainHeaderReader, headers []*types.
 	return abort, results
 }
 
+// VerifyHeaders is similar to VerifyHeader, but verifies a batch of headers. The
+// method returns a quit channel to abort the operations and a results channel to
+// retrieve the async verifications (the order is that of the input slice).
+func (c *Bor) VerifyHeaders(chain consensus.ChainHeaderReader, headers []*types.Header, seals []bool) (chan<- struct{}, <-chan error) {
+	return c.verifyHeaders(chain, headers, seals, nil)
+}
+
+// VerifyHeadersWithValidators is similar to VerifyHeaderWithValidators, but verifies a batch of headers. The
+// method returns a quit channel to abort the operations and a results channel to
+// retrieve the async verifications (the order is that of the input slice).
+func (c *Bor) VerifyHeadersWithValidators(chain consensus.ChainHeaderReader, headers []*types.Header, seals []bool, validators []*Validator) (chan<- struct{}, <-chan error) {
+	return c.verifyHeaders(chain, headers, nil, validators)
+}
+
 // verifyHeader checks whether a header conforms to the consensus rules.The
 // caller may optionally pass in a batch of parents (ascending order) to avoid
 // looking those up from the database. This is useful for concurrently verifying
 // a batch of new headers.
-func (c *Bor) verifyHeader(chain consensus.ChainHeaderReader, header *types.Header, parents []*types.Header) error {
+func (c *Bor) verifyHeader(chain consensus.ChainHeaderReader, header *types.Header, parents []*types.Header, validators []*Validator) error {
 	if header.Number == nil {
 		return errUnknownBlock
 	}
@@ -371,7 +387,7 @@ func (c *Bor) verifyHeader(chain consensus.ChainHeaderReader, header *types.Head
 		return err
 	}
 	// All basic checks passed, verify cascading fields
-	return c.verifyCascadingFields(chain, header, parents)
+	return c.verifyCascadingFields(chain, header, parents, validators)
 }
 
 // validateHeaderExtraField validates that the extra-data contains both the vanity and signature.
@@ -390,7 +406,7 @@ func validateHeaderExtraField(extraBytes []byte) error {
 // rather depend on a batch of previous headers. The caller may optionally pass
 // in a batch of parents (ascending order) to avoid looking those up from the
 // database. This is useful for concurrently verifying a batch of new headers.
-func (c *Bor) verifyCascadingFields(chain consensus.ChainHeaderReader, header *types.Header, parents []*types.Header) error {
+func (c *Bor) verifyCascadingFields(chain consensus.ChainHeaderReader, header *types.Header, parents []*types.Header, validators []*Validator) error {
 	// The genesis block is the always valid dead-end
 	number := header.Number.Uint64()
 	if number == 0 {
@@ -431,7 +447,7 @@ func (c *Bor) verifyCascadingFields(chain consensus.ChainHeaderReader, header *t
 	}
 
 	// Retrieve the snapshot needed to verify this header and cache it
-	snap, err := c.snapshot(chain, number-1, header.ParentHash, parents)
+	snap, err := c.snapshot(chain, number-1, header.ParentHash, parents, validators)
 	if err != nil {
 		return err
 	}
@@ -454,11 +470,11 @@ func (c *Bor) verifyCascadingFields(chain consensus.ChainHeaderReader, header *t
 	}
 
 	// All basic checks passed, verify the seal and return
-	return c.verifySeal(chain, header, parents)
+	return c.verifySeal(chain, header, parents, validators)
 }
 
 // snapshot retrieves the authorization snapshot at a given point in time.
-func (c *Bor) snapshot(chain consensus.ChainHeaderReader, number uint64, hash common.Hash, parents []*types.Header) (*Snapshot, error) {
+func (c *Bor) snapshot(chain consensus.ChainHeaderReader, number uint64, hash common.Hash, parents []*types.Header, validators []*Validator) (*Snapshot, error) {
 	// Search for a snapshot in memory or on disk for checkpoints
 	var (
 		headers []*types.Header
@@ -492,10 +508,13 @@ func (c *Bor) snapshot(chain consensus.ChainHeaderReader, number uint64, hash co
 				// get checkpoint data
 				hash := checkpoint.Hash()
 
-				// get validators and current span
-				validators, err := c.GetCurrentValidators(hash, number+1)
-				if err != nil {
-					return nil, err
+				if validators == nil {
+					// get validators and current span
+					var err error
+					validators, err = c.GetCurrentValidators(hash, number+1)
+					if err != nil {
+						return nil, err
+					}
 				}
 
 				// new snap shot
@@ -554,6 +573,18 @@ func (c *Bor) snapshot(chain consensus.ChainHeaderReader, number uint64, hash co
 	return snap, err
 }
 
+// AddSnapshot stores a snapshot to the LRU cache.
+func (c *Bor) AddSnapshot(snap *Snapshot) {
+	snap.config = c.config
+	snap.sigcache = c.signatures
+	c.recents.Add(snap.Hash, snap)
+}
+
+// Snapshot creates a snapshot.
+func (c *Bor) Snapshot(chain consensus.ChainHeaderReader, number uint64, hash common.Hash, parents []*types.Header, validators []*Validator) (*Snapshot, error) {
+	return c.snapshot(chain, number, hash, parents, validators)
+}
+
 // VerifyUncles implements consensus.Engine, always returning an error for any
 // uncles as this consensus mechanism doesn't permit uncles.
 func (c *Bor) VerifyUncles(chain consensus.ChainReader, block *types.Block) error {
@@ -566,21 +597,21 @@ func (c *Bor) VerifyUncles(chain consensus.ChainReader, block *types.Block) erro
 // VerifySeal implements consensus.Engine, checking whether the signature contained
 // in the header satisfies the consensus protocol requirements.
 func (c *Bor) VerifySeal(chain consensus.ChainHeaderReader, header *types.Header) error {
-	return c.verifySeal(chain, header, nil)
+	return c.verifySeal(chain, header, nil, nil)
 }
 
 // verifySeal checks whether the signature contained in the header satisfies the
 // consensus protocol requirements. The method accepts an optional list of parent
 // headers that aren't yet part of the local blockchain to generate the snapshots
 // from.
-func (c *Bor) verifySeal(chain consensus.ChainHeaderReader, header *types.Header, parents []*types.Header) error {
+func (c *Bor) verifySeal(chain consensus.ChainHeaderReader, header *types.Header, parents []*types.Header, validators []*Validator) error {
 	// Verifying the genesis block is not supported
 	number := header.Number.Uint64()
 	if number == 0 {
 		return errUnknownBlock
 	}
 	// Retrieve the snapshot needed to verify this header and cache it
-	snap, err := c.snapshot(chain, number-1, header.ParentHash, parents)
+	snap, err := c.snapshot(chain, number-1, header.ParentHash, parents, validators)
 	if err != nil {
 		return err
 	}
@@ -631,7 +662,7 @@ func (c *Bor) Prepare(chain consensus.ChainHeaderReader, header *types.Header) e
 
 	number := header.Number.Uint64()
 	// Assemble the validator snapshot to check which votes make sense
-	snap, err := c.snapshot(chain, number-1, header.ParentHash, nil)
+	snap, err := c.snapshot(chain, number-1, header.ParentHash, nil, nil)
 	if err != nil {
 		return err
 	}
@@ -830,7 +861,7 @@ func (c *Bor) Seal(chain consensus.ChainHeaderReader, block *types.Block, result
 	signer, signFn := c.signer, c.signFn
 	c.lock.RUnlock()
 
-	snap, err := c.snapshot(chain, number-1, header.ParentHash, nil)
+	snap, err := c.snapshot(chain, number-1, header.ParentHash, nil, nil)
 	if err != nil {
 		return err
 	}
@@ -894,7 +925,7 @@ func (c *Bor) Seal(chain consensus.ChainHeaderReader, block *types.Block, result
 // that a new block should have based on the previous blocks in the chain and the
 // current signer.
 func (c *Bor) CalcDifficulty(chain consensus.ChainHeaderReader, time uint64, parent *types.Header) *big.Int {
-	snap, err := c.snapshot(chain, parent.Number.Uint64(), parent.Hash(), nil)
+	snap, err := c.snapshot(chain, parent.Number.Uint64(), parent.Hash(), nil, nil)
 	if err != nil {
 		return nil
 	}
@@ -1230,7 +1261,7 @@ func (c *Bor) getNextHeimdallSpanForTest(
 	// get local chain context object
 	localContext := chain.(chainContext)
 	// Retrieve the snapshot needed to verify this header and cache it
-	snap, err := c.snapshot(localContext.Chain, headerNumber-1, header.ParentHash, nil)
+	snap, err := c.snapshot(localContext.Chain, headerNumber-1, header.ParentHash, nil, nil)
 	if err != nil {
 		return nil, err
 	}
